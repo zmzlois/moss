@@ -1,19 +1,17 @@
 # Moss iOS Example
 
 A SwiftUI app that demonstrates the [Moss Swift SDK](https://github.com/usemoss/moss)
-- fast, on-device semantic search for iOS.
+for iOS with an **on-device session**: build an index on-device, push it to
+the cloud, and load it back into a fresh session.
 
-Documents are embedded and searched **on the device** - no network calls for
-the core flow. The app walks a session end-to-end, with per-step timing:
+The app walks the flow end-to-end, with per-step timing:
 
-`session` → `addDocs` (embedded locally) → `query` → `getDocs` →
-`deleteDocs` → `save` → reopen → `loadFromDisk`
+`session` → `addDocs` (embedded on-device) → `query` → `deleteDocs` →
+`pushIndex` (local → cloud) → poll `getJobStatus` until ready →
+`loadIndex` (cloud → a new session) → query
 
-It then demonstrates the **cloud round-trip**: `pushIndex` (local → cloud) →
-poll `getJobStatus` until ready → `loadIndex` (cloud → a new session) → query.
-Because the session keeps its on-device model throughout, the loaded-back
-index queries locally with no model mismatch. This part needs network access
-and valid credentials.
+Documents are embedded on-device, and the loaded-back index queries locally.
+The push/load steps need network access and valid credentials.
 
 ## Architecture
 
@@ -53,8 +51,8 @@ network.
 
 ## Quick start
 
-The whole API is `async`/`throws`. Construct a client, open a session, then
-add and query documents - all on-device:
+The whole API is `async`/`throws`. Build an index on-device, push it to the
+cloud, then load it back into a fresh session:
 
 ```swift
 import Moss
@@ -62,23 +60,48 @@ import Moss
 let client = try MossClient(projectId: "your_project_id", projectKey: "your_project_key")
 defer { client.close() }
 
+// 1. Build an index on-device.
 let session = try await client.session("notes")
-defer { session.close() }
-
 try await session.addDocs([
     .init(id: "1", text: "Transformers replaced RNNs for sequence modeling."),
     .init(id: "2", text: "Embeddings map text into vectors for similarity search."),
 ])
 
-let hits = try await session.query("how do transformers work", options: .init(topK: 3))
-hits.docs.forEach { print($0.score, $0.id) }
+// 2. Push it to the cloud and wait for the job to finish.
+let push = try await session.pushIndex()
+session.close()
+while try await client.getJobStatus(push.jobId).status != "ready" {
+    try await Task.sleep(nanoseconds: 1_000_000_000)
+}
 
-// Persist so the next launch skips re-embedding.
-try await session.save(toCachePath: NSTemporaryDirectory())
+// 3. Load it back into a new session and query - still on-device.
+let restored = try await client.session(push.indexName)
+defer { restored.close() }
+_ = try await restored.loadIndex(push.indexName)
+
+let hits = try await restored.query("how do transformers work", options: .init(topK: 3))
+hits.docs.forEach { print($0.score, $0.id) }
 ```
 
 See [`MossDemoModel.swift`](MossExample/MossDemoModel.swift) for every call
 exercised end-to-end with timing.
+
+### Local persistence (no cloud)
+
+If you don't need the cloud, a session can persist to disk and reopen on the
+next launch - fully offline, no network:
+
+```swift
+let session = try await client.session("notes")
+try await session.addDocs([ /* ... */ ])
+try await session.save(toCachePath: NSTemporaryDirectory())
+session.close()
+
+// Later, or on the next launch:
+let restored = try await client.session("notes")
+try await restored.loadFromDisk(cachePath: NSTemporaryDirectory())
+let hits = try await restored.query("how do transformers work", options: .init(topK: 3))
+```
 
 ## Requirements
 
@@ -88,6 +111,12 @@ exercised end-to-end with timing.
   simulator); Intel simulators are not supported.
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) to generate the project:
   `brew install xcodegen`
+
+## Get your credentials
+
+Sign up at [moss.dev](https://moss.dev) for a `project_id` and `project_key`
+(free tier available), then enter them on the app's first launch. See the
+[main Quickstart](https://github.com/usemoss/moss#quickstart) for more.
 
 ## The SDK dependency
 
@@ -143,11 +172,11 @@ To target a specific simulator instead, pass e.g.
 
 ## Using it
 
-1. **First launch** shows a credentials screen. Enter your Moss project ID
-   and key from the [Moss dashboard](https://portal.usemoss.dev) - they're
-   required to authenticate the client.
-2. Tap **Run Session Demo** to walk the full flow - the on-device session
-   followed by the cloud round-trip. The log shows each step and its timing.
+1. **First launch** shows a credentials screen. Enter the `project_id` and
+   `project_key` from [moss.dev](https://moss.dev) (see
+   [Get your credentials](#get-your-credentials)) - they authenticate the client.
+2. Tap **Run Session Demo** to walk the full flow - build on-device, push to
+   the cloud, then load back. The log shows each step and its timing.
 
 ## Code tour
 
@@ -157,7 +186,7 @@ To target a specific simulator instead, pass e.g.
 | [`ContentView.swift`](MossExample/ContentView.swift) | SwiftUI wiring - credentials screen and the demo button. |
 | [`MossExampleApp.swift`](MossExample/MossExampleApp.swift) | App entry point. |
 
-## Credentials
+## Credentials in production
 
 To keep the sample short, it stores the project key in `@AppStorage`. For a
 production app, use the `Authenticator` protocol instead: your app fetches a
